@@ -1,0 +1,250 @@
+;; ============================================================
+;;  TON Prediction Market Smart Contract  (FunC)
+;;  One contract per market. Deploy a fresh copy per event.
+;; ============================================================
+;;
+;;  Storage layout (c4):
+;;    creator_address   MsgAddress
+;;    status            uint8   0=open 1=closed 2=resolved 3=cancelled
+;;    yes_pool          coins
+;;    no_pool           coins
+;;    bet_closes_at     uint32  unix timestamp
+;;    winning_outcome   uint8   0=none 1=yes 2=no
+;;    platform_address  MsgAddress  (receives fee)
+;;    fee_bps           uint16  200 = 2%
+;;
+;;  Op codes (in_msg body):
+;;    0x01  place_bet(outcome: uint8)   -- outcome: 1=yes 2=no
+;;    0x02  resolve(outcome: uint8)     -- creator only
+;;    0x03  cancel                      -- creator only, refunds all
+;;    0x04  claim_payout                -- winner claims after resolution
+;;
+;; ============================================================
+
+#include "stdlib.fc";
+
+;; ── Storage helpers ──────────────────────────────────────────
+
+(slice, int, int, int, int, int, slice, int) load_data() inline {
+    var ds = get_data().begin_parse();
+    return (
+        ds~load_msg_addr(),   ;; creator_address
+        ds~load_uint(8),      ;; status
+        ds~load_coins(),      ;; yes_pool
+        ds~load_coins(),      ;; no_pool
+        ds~load_uint(32),     ;; bet_closes_at
+        ds~load_uint(8),      ;; winning_outcome
+        ds~load_msg_addr(),   ;; platform_address
+        ds~load_uint(16)      ;; fee_bps
+    );
+}
+
+() save_data(
+    slice creator, int status,
+    int yes_pool, int no_pool,
+    int closes_at, int winning_outcome,
+    slice platform, int fee_bps
+) impure inline {
+    set_data(
+        begin_cell()
+            .store_slice(creator)
+            .store_uint(status, 8)
+            .store_coins(yes_pool)
+            .store_coins(no_pool)
+            .store_uint(closes_at, 32)
+            .store_uint(winning_outcome, 8)
+            .store_slice(platform)
+            .store_uint(fee_bps, 16)
+        .end_cell()
+    );
+}
+
+;; ── Send TON helper ──────────────────────────────────────────
+
+() send_ton(slice to_addr, int amount, int mode) impure inline {
+    var msg = begin_cell()
+        .store_uint(0x10, 6)        ;; non-bounceable
+        .store_slice(to_addr)
+        .store_coins(amount)
+        .store_uint(0, 1 + 4 + 4 + 64 + 32 + 1 + 1)
+    .end_cell();
+    send_raw_message(msg, mode);
+}
+
+;; ── Bet storage (persistent dict in c3) ─────────────────────
+;;   key:   256-bit address hash
+;;   value: (outcome: uint8, amount: coins)
+
+cell load_bets() inline {
+    var cs = get_c3();
+    if (cs.null?()) { return new_dict(); }
+    return cs;
+}
+
+() save_bets(cell bets) impure inline {
+    set_c3(bets);
+}
+
+;; ── Main recv_internal ───────────────────────────────────────
+
+() recv_internal(int msg_value, cell in_msg_full, slice in_msg_body) impure {
+    ;; Ignore empty messages (simple TON transfers with no body)
+    if (in_msg_body.slice_empty?()) { return (); }
+
+    slice cs = in_msg_full.begin_parse();
+    int flags = cs~load_uint(4);
+    if (flags & 1) { return (); }   ;; ignore bounced
+
+    slice sender = cs~load_msg_addr();
+    int op = in_msg_body~load_uint(32);
+
+    var (creator, status, yes_pool, no_pool, closes_at, winning_outcome, platform, fee_bps) = load_data();
+
+    ;; ── op 0x01: place_bet ───────────────────────────────────
+    if (op == 0x01) {
+        throw_unless(100, status == 0);                   ;; market must be open
+        throw_unless(101, now() < closes_at);             ;; betting window open
+        throw_unless(102, msg_value >= 100000000);        ;; min 0.1 TON
+
+        int outcome = in_msg_body~load_uint(8);
+        throw_unless(103, (outcome == 1) | (outcome == 2));
+
+        if (outcome == 1) {
+            yes_pool += msg_value;
+        } else {
+            no_pool += msg_value;
+        }
+
+        ;; Record bet in dict
+        cell bets = load_bets();
+        (_, int addr_hash) = parse_std_addr(sender);
+        var existing = bets.udict_get?(256, addr_hash);
+        ;; Simple model: one bet per address (add to existing)
+        int prev_amount = 0;
+        int prev_outcome = 0;
+        if (~ existing.null?()) {
+            var prev = existing;
+            prev_outcome = prev~load_uint(8);
+            prev_amount = prev~load_coins();
+        }
+        ;; Only same-outcome additions allowed
+        if ((prev_amount > 0) & (prev_outcome != outcome)) {
+            throw(104);   ;; can't bet both sides
+        }
+        bets~udict_set_builder(256, addr_hash,
+            begin_cell().store_uint(outcome, 8).store_coins(prev_amount + msg_value)
+        );
+        save_bets(bets);
+        save_data(creator, status, yes_pool, no_pool, closes_at, winning_outcome, platform, fee_bps);
+        return ();
+    }
+
+    ;; ── op 0x02: resolve ─────────────────────────────────────
+    if (op == 0x02) {
+        throw_unless(200, equal_slices(sender, creator));  ;; only creator
+        throw_unless(201, (status == 0) | (status == 1)); ;; open or closed
+        throw_unless(202, now() >= closes_at);            ;; betting must have ended
+
+        int outcome = in_msg_body~load_uint(8);
+        throw_unless(203, (outcome == 1) | (outcome == 2));
+
+        ;; Calculate fee and send to platform
+        int total_pool = yes_pool + no_pool;
+        int fee_amount = muldiv(total_pool, fee_bps, 10000);
+        int distributable = total_pool - fee_amount;
+
+        if (fee_amount > 0) {
+            send_ton(platform, fee_amount, 1);
+        }
+
+        save_data(creator, 2, yes_pool, no_pool, closes_at, outcome, platform, fee_bps);
+        return ();
+    }
+
+    ;; ── op 0x03: cancel ──────────────────────────────────────
+    if (op == 0x03) {
+        throw_unless(300, equal_slices(sender, creator));
+        throw_unless(301, status < 2);   ;; not yet resolved
+
+        save_data(creator, 3, yes_pool, no_pool, closes_at, winning_outcome, platform, fee_bps);
+        ;; Note: refunds are claimed individually via op 0x04 in cancelled state
+        return ();
+    }
+
+    ;; ── op 0x04: claim_payout ────────────────────────────────
+    if (op == 0x04) {
+        throw_unless(400, (status == 2) | (status == 3));  ;; resolved or cancelled
+
+        (_, int addr_hash) = parse_std_addr(sender);
+        cell bets = load_bets();
+        (slice bet_data, int found) = bets.udict_get?(256, addr_hash);
+        throw_unless(401, found);
+
+        int bet_outcome = bet_data~load_uint(8);
+        int bet_amount = bet_data~load_coins();
+        throw_unless(402, bet_amount > 0);
+
+        int payout = 0;
+        if (status == 3) {
+            ;; Cancelled: full refund
+            payout = bet_amount;
+        } else {
+            ;; Resolved
+            if (bet_outcome == winning_outcome) {
+                int win_pool = (winning_outcome == 1) ? yes_pool : no_pool;
+                int total_pool = yes_pool + no_pool;
+                int distributable = total_pool - muldiv(total_pool, fee_bps, 10000);
+                payout = muldiv(bet_amount, distributable, win_pool);
+            } else {
+                throw(403);  ;; loser has nothing to claim
+            }
+        }
+
+        throw_unless(404, payout > 0);
+
+        ;; Delete bet to prevent double-claim
+        bets~udict_delete?(256, addr_hash);
+        save_bets(bets);
+
+        send_ton(sender, payout, 1);
+        return ();
+    }
+
+    throw(0xffff);  ;; unknown op
+}
+
+;; ── Getters (read-only, called off-chain) ────────────────────
+
+(int, int, int, int, int) get_market_data() method_id {
+    var (_, status, yes_pool, no_pool, closes_at, winning_outcome, _, _) = load_data();
+    return (status, yes_pool, no_pool, closes_at, winning_outcome);
+}
+
+(int, int) get_bet(slice addr) method_id {
+    (_, int addr_hash) = parse_std_addr(addr);
+    cell bets = load_bets();
+    (slice bet_data, int found) = bets.udict_get?(256, addr_hash);
+    if (~ found) { return (0, 0); }
+    int outcome = bet_data~load_uint(8);
+    int amount = bet_data~load_coins();
+    return (outcome, amount);
+}
+
+int get_potential_payout(slice addr) method_id {
+    (_, int status, int yes_pool, int no_pool, _, int winning_outcome, _, int fee_bps) = load_data();
+    if (status != 2) { return 0; }
+
+    (_, int addr_hash) = parse_std_addr(addr);
+    cell bets = load_bets();
+    (slice bet_data, int found) = bets.udict_get?(256, addr_hash);
+    if (~ found) { return 0; }
+
+    int bet_outcome = bet_data~load_uint(8);
+    int bet_amount = bet_data~load_coins();
+    if (bet_outcome != winning_outcome) { return 0; }
+
+    int win_pool = (winning_outcome == 1) ? yes_pool : no_pool;
+    int total = yes_pool + no_pool;
+    int distributable = total - muldiv(total, fee_bps, 10000);
+    return muldiv(bet_amount, distributable, win_pool);
+}
