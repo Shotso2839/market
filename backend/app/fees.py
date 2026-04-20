@@ -135,6 +135,28 @@ def dynamic_taker_fee(
 
 # ── Пиковая ставка по категории (для отображения в UI) ───────────────────────
 
+def calculate_bet_fee(
+    amount_nano: int,
+    user_bet_count: int = 0,
+    yes_probability: float = 0.5,
+    category: str = MarketCategory.OTHER,
+    free_bets: int | None = None,
+) -> "BetFeeResult":
+    """
+    Backward-compatible wrapper for callers that still use the legacy fee API.
+
+    If the caller does not pass a live market probability yet, we assume a
+    neutral 50/50 market and reuse the dynamic taker-fee engine underneath.
+    """
+    return dynamic_taker_fee(
+        amount_nano=amount_nano,
+        yes_probability=yes_probability,
+        category=category,
+        user_bet_count=user_bet_count,
+        free_bets=FEE.free_bets_count if free_bets is None else free_bets,
+    )
+
+
 def peak_fee_pct(category: str = MarketCategory.OTHER) -> float:
     """
     Максимальная комиссия для категории (при p=0.50).

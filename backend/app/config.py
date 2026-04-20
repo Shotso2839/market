@@ -14,6 +14,8 @@ class Settings(BaseSettings):
     TON_API_KEY: str = ""
     TON_NETWORK: str = "testnet"  # "mainnet" | "testnet"
     TON_API_URL: str = "https://testnet.toncenter.com/api/v2"
+    OPERATOR_URL: str = "http://localhost:8081"
+    CLOB_SERVICE_URL: str = "http://localhost:8081"
 
     # Smart contract
     PREDICTION_CONTRACT_ADDRESS: str = ""  # Deploy and set here

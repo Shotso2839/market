@@ -1,0 +1,380 @@
+;; ============================================================
+;;  TON CTFExchange  —  TON port of Polymarket/ctf-exchange
+;;
+;;  Hybrid decentralised model (mirrors Polymarket architecture):
+;;    OFF-CHAIN:  Go operator service matches orders, computes
+;;                LMSR price, signs settlement authorisations
+;;    ON-CHAIN:   FunC contract settles atomically, non-custodial
+;;
+;;  Key equivalences with Polymarket:
+;;    ERC-1155 outcome tokens  →  share balances in contract dict
+;;    USDC collateral          →  native TON nanotons
+;;    ECDSA / EIP-712 sigs     →  ed25519 (native TON)
+;;    Ethereum operator        →  Go operator service
+;;    fillOrder / fillOrders   →  op 0x10 buy / op 0x11 sell
+;;    CTF.redeemPositions      →  op 0x13 claim_payout
+;;
+;;  Op codes:
+;;    0x10  buy_shares       – deposit TON → receive YES/NO shares
+;;    0x11  sell_shares      – return shares → receive TON (op sig)
+;;    0x12  resolve          – oracle declares winner
+;;    0x13  claim_payout     – winners redeem shares for 1 TON each
+;;    0x14  cancel_market    – emergency cancel, refunds available
+;;    0x15  register_market  – platform registers a new market
+;;
+;;  c4 storage:
+;;    operator_pubkey : uint256   ed25519 key of Go operator
+;;    platform_addr   : MsgAddr   receives protocol fees
+;;    fee_bps         : uint16    100 = 1% (set per-market by operator)
+;;    paused          : uint1
+;;    markets         : HashmapE(64 → Market cell)
+;;
+;;  c3  (share ledger, separate to keep c4 small):
+;;    HashmapE(256 → ShareBalance)
+;;    key = cell_hash( market_id_64 || addr_hash_256 )
+;;
+;; ============================================================
+
+#include "stdlib.fc";
+
+const int MIN_BET     = 100000000;  ;; 0.1 TON
+const int NANO        = 1000000000; ;; 1 TON in nanoTON
+const int GAS_RESERVE = 50000000;   ;; 0.05 TON kept for gas
+
+;; ── Global state ──────────────────────────────────────────────
+
+(int, slice, int, int, cell) load_global() inline {
+    var ds = get_data().begin_parse();
+    return (
+        ds~load_uint(256),
+        ds~load_msg_addr(),
+        ds~load_uint(16),
+        ds~load_uint(1),
+        ds~load_dict()
+    );
+}
+
+() save_global(int op_key, slice platform, int fee_bps, int paused, cell markets) impure inline {
+    set_data(
+        begin_cell()
+            .store_uint(op_key, 256)
+            .store_slice(platform)
+            .store_uint(fee_bps, 16)
+            .store_uint(paused, 1)
+            .store_dict(markets)
+        .end_cell()
+    );
+}
+
+;; ── Market packing ────────────────────────────────────────────
+
+cell pack_market(int status, int winner, int closes_at, int yes_total, int no_total) inline {
+    return begin_cell()
+        .store_uint(status,    8)
+        .store_uint(winner,    8)
+        .store_uint(closes_at, 32)
+        .store_coins(yes_total)
+        .store_coins(no_total)
+    .end_cell();
+}
+
+(int, int, int, int, int) unpack_market(cell c) inline {
+    var cs = c.begin_parse();
+    return (
+        cs~load_uint(8),
+        cs~load_uint(8),
+        cs~load_uint(32),
+        cs~load_coins(),
+        cs~load_coins()
+    );
+}
+
+;; ── Share ledger (c3) ─────────────────────────────────────────
+
+cell load_ledger() inline {
+    var c = get_c3();
+    if (c.null?()) { return new_dict(); }
+    return c;
+}
+
+() save_ledger(cell ledger) impure inline { set_c3(ledger); }
+
+int share_key(int market_id, int addr_hash) inline {
+    return begin_cell()
+        .store_uint(market_id, 64)
+        .store_uint(addr_hash, 256)
+    .end_cell().cell_hash();
+}
+
+(int, int) read_shares(cell ledger, int key) inline {
+    (slice val, int found) = ledger.udict_get?(256, key);
+    if (~ found) { return (0, 0); }
+    return (val~load_coins(), val~load_coins());
+}
+
+cell write_shares(cell ledger, int key, int yes_s, int no_s) inline {
+    ledger~udict_set_builder(256, key,
+        begin_cell().store_coins(yes_s).store_coins(no_s));
+    return ledger;
+}
+
+;; ── Helpers ───────────────────────────────────────────────────
+
+() send_ton(slice to, int amount, int mode) impure inline {
+    send_raw_message(
+        begin_cell()
+            .store_uint(0x10, 6)
+            .store_slice(to)
+            .store_coins(amount)
+            .store_uint(0, 107)
+        .end_cell(),
+        mode
+    );
+}
+
+;; Verify ed25519 signature from Go operator service
+;; Payload = sha256( market_id || addr_hash || outcome ||
+;;                   shares || min_proceeds || expiry )
+int verify_op_sig(int pubkey, int market_id, int addr_hash,
+                  int outcome, int shares, int proceeds, int expiry,
+                  slice sig) inline {
+    int h = begin_cell()
+        .store_uint(market_id, 64)
+        .store_uint(addr_hash, 256)
+        .store_uint(outcome,   8)
+        .store_coins(shares)
+        .store_coins(proceeds)
+        .store_uint(expiry,    32)
+    .end_cell().cell_hash();
+    return check_data_signature(h, sig, pubkey);
+}
+
+;; ── recv_internal ─────────────────────────────────────────────
+
+() recv_internal(int msg_value, cell in_msg_full, slice in_msg_body) impure {
+    if (in_msg_body.slice_empty?()) { return (); }
+    slice cs    = in_msg_full.begin_parse();
+    int   flags = cs~load_uint(4);
+    if (flags & 1) { return (); }
+    slice sender    = cs~load_msg_addr();
+    (_, int addr_h) = parse_std_addr(sender);
+    int op = in_msg_body~load_uint(32);
+    var (op_key, platform, fee_bps, paused, markets) = load_global();
+
+    ;; ─────────────────────────────────────────────────────────
+    ;; 0x15  register_market
+    ;; Polymarket equivalent: market creation via Gamma API
+    ;; ─────────────────────────────────────────────────────────
+    if (op == 0x15) {
+        throw_unless(500, equal_slices(sender, platform));
+        int mkt_id    = in_msg_body~load_uint(64);
+        int closes_at = in_msg_body~load_uint(32);
+        markets~udict_set_ref(64, mkt_id, pack_market(0, 0, closes_at, 0, 0));
+        save_global(op_key, platform, fee_bps, paused, markets);
+        return ();
+    }
+
+    ;; ─────────────────────────────────────────────────────────
+    ;; 0x10  buy_shares
+    ;; Polymarket equivalent: fillOrder where taker side == BUY
+    ;; User deposits TON collateral, receives outcome shares.
+    ;; LMSR price is computed off-chain by Go operator and
+    ;; communicated as min_shares (slippage protection).
+    ;; ─────────────────────────────────────────────────────────
+    if (op == 0x10) {
+        throw_unless(100, ~ paused);
+        throw_unless(101, msg_value >= MIN_BET);
+
+        int mkt_id     = in_msg_body~load_uint(64);
+        int outcome    = in_msg_body~load_uint(8);
+        int min_shares = in_msg_body~load_coins();
+
+        throw_unless(102, (outcome == 1) | (outcome == 2));
+
+        (cell mdata, int found) = markets.udict_get_ref?(64, mkt_id);
+        throw_unless(103, found);
+        var (status, winner, closes_at, yes_t, no_t) = unpack_market(mdata);
+        throw_unless(104, status == 0);
+        throw_unless(105, now() < closes_at);
+
+        ;; Dynamic fee deduction (fee_bps set by Go operator per trade)
+        int fee  = muldiv(msg_value, fee_bps, 10000);
+        int net  = msg_value - fee;
+
+        ;; Shares minted = net nanoTON deposited.
+        ;; Conceptually: 1 share = 1 nanoTON of collateral at current price.
+        ;; Go operator validated min_shares against LMSR price off-chain.
+        int shares = net;
+        throw_unless(106, shares >= min_shares);
+
+        if (outcome == 1) { yes_t += shares; }
+        else              { no_t  += shares; }
+
+        cell ledger = load_ledger();
+        int skey = share_key(mkt_id, addr_h);
+        (int u_yes, int u_no) = read_shares(ledger, skey);
+        if (outcome == 1) { u_yes += shares; }
+        else              { u_no  += shares; }
+        save_ledger(write_shares(ledger, skey, u_yes, u_no));
+
+        if (fee > 0) { send_ton(platform, fee, 1); }
+
+        markets~udict_set_ref(64, mkt_id, pack_market(status, winner, closes_at, yes_t, no_t));
+        save_global(op_key, platform, fee_bps, paused, markets);
+        return ();
+    }
+
+    ;; ─────────────────────────────────────────────────────────
+    ;; 0x11  sell_shares
+    ;; Polymarket equivalent: fillOrder where maker side == SELL
+    ;; User returns outcome shares, receives TON collateral back.
+    ;; Go operator signs the proceeds amount (LMSR sell price)
+    ;; with ed25519 — contract verifies sig before releasing TON.
+    ;; This is the key feature: exit a position at any time.
+    ;; ─────────────────────────────────────────────────────────
+    if (op == 0x11) {
+        throw_unless(200, ~ paused);
+
+        int mkt_id       = in_msg_body~load_uint(64);
+        int outcome      = in_msg_body~load_uint(8);
+        int shares_sell  = in_msg_body~load_coins();
+        int min_proceeds = in_msg_body~load_coins();
+        int expiry       = in_msg_body~load_uint(32);
+        slice sig        = in_msg_body~load_bits(512);
+
+        throw_unless(201, (outcome == 1) | (outcome == 2));
+        throw_unless(202, now() < expiry);
+
+        ;; Core security: operator signature proves LMSR price is valid
+        throw_unless(203,
+            verify_op_sig(op_key, mkt_id, addr_h, outcome,
+                          shares_sell, min_proceeds, expiry, sig));
+
+        (cell mdata, int found) = markets.udict_get_ref?(64, mkt_id);
+        throw_unless(204, found);
+        var (status, winner, closes_at, yes_t, no_t) = unpack_market(mdata);
+        throw_unless(205, (status == 0) | (status == 1));
+
+        cell ledger = load_ledger();
+        int skey = share_key(mkt_id, addr_h);
+        (int u_yes, int u_no) = read_shares(ledger, skey);
+
+        if (outcome == 1) {
+            throw_unless(206, u_yes >= shares_sell);
+            u_yes -= shares_sell;
+            yes_t -= shares_sell;
+        } else {
+            throw_unless(206, u_no >= shares_sell);
+            u_no -= shares_sell;
+            no_t -= shares_sell;
+        }
+
+        ;; Solvency: proceeds cannot exceed remaining collateral
+        int remaining_collateral = yes_t + no_t;
+        throw_unless(207, min_proceeds <= remaining_collateral + shares_sell);
+
+        int fee    = muldiv(min_proceeds, fee_bps, 10000);
+        int payout = min_proceeds - fee;
+        throw_unless(208, payout > GAS_RESERVE);
+
+        save_ledger(write_shares(ledger, skey, u_yes, u_no));
+        markets~udict_set_ref(64, mkt_id, pack_market(status, winner, closes_at, yes_t, no_t));
+        save_global(op_key, platform, fee_bps, paused, markets);
+
+        send_ton(sender, payout, 1);
+        if (fee > 0) { send_ton(platform, fee, 1); }
+        return ();
+    }
+
+    ;; ─────────────────────────────────────────────────────────
+    ;; 0x12  resolve
+    ;; Polymarket equivalent: UMA oracle reporting outcome
+    ;; ─────────────────────────────────────────────────────────
+    if (op == 0x12) {
+        throw_unless(300, equal_slices(sender, platform));
+        int mkt_id  = in_msg_body~load_uint(64);
+        int outcome = in_msg_body~load_uint(8);
+        throw_unless(301, (outcome == 1) | (outcome == 2));
+
+        (cell mdata, int found) = markets.udict_get_ref?(64, mkt_id);
+        throw_unless(302, found);
+        var (status, _, closes_at, yes_t, no_t) = unpack_market(mdata);
+        throw_unless(303, (status == 0) | (status == 1));
+
+        markets~udict_set_ref(64, mkt_id, pack_market(2, outcome, closes_at, yes_t, no_t));
+        save_global(op_key, platform, fee_bps, paused, markets);
+        return ();
+    }
+
+    ;; ─────────────────────────────────────────────────────────
+    ;; 0x13  claim_payout
+    ;; Polymarket equivalent: CTF.redeemPositions()
+    ;; Each winning share redeems exactly 1 nanoTON of collateral.
+    ;; ─────────────────────────────────────────────────────────
+    if (op == 0x13) {
+        int mkt_id = in_msg_body~load_uint(64);
+
+        (cell mdata, int found) = markets.udict_get_ref?(64, mkt_id);
+        throw_unless(400, found);
+        var (status, winner, _, _, _) = unpack_market(mdata);
+        throw_unless(401, (status == 2) | (status == 3));
+
+        cell ledger = load_ledger();
+        int skey = share_key(mkt_id, addr_h);
+        (int u_yes, int u_no) = read_shares(ledger, skey);
+
+        int payout = 0;
+        if (status == 3) {
+            payout = u_yes + u_no;  ;; cancelled: full refund
+        } else {
+            payout = (winner == 1) ? u_yes : u_no;
+        }
+        throw_unless(402, payout > 0);
+
+        save_ledger(write_shares(ledger, skey, 0, 0));
+        send_ton(sender, payout, 1);
+        return ();
+    }
+
+    ;; ─────────────────────────────────────────────────────────
+    ;; 0x14  cancel_market  (emergency)
+    ;; ─────────────────────────────────────────────────────────
+    if (op == 0x14) {
+        throw_unless(500, equal_slices(sender, platform));
+        int mkt_id = in_msg_body~load_uint(64);
+        (cell mdata, int found) = markets.udict_get_ref?(64, mkt_id);
+        throw_unless(501, found);
+        var (status, _, closes_at, yes_t, no_t) = unpack_market(mdata);
+        throw_unless(502, status < 2);
+        markets~udict_set_ref(64, mkt_id, pack_market(3, 0, closes_at, yes_t, no_t));
+        save_global(op_key, platform, fee_bps, paused, markets);
+        return ();
+    }
+
+    throw(0xffff);
+}
+
+;; ── Getters ───────────────────────────────────────────────────
+
+(int, int, int, int, int) get_market(int market_id) method_id {
+    var (_, _, _, _, markets) = load_global();
+    (cell mdata, int found) = markets.udict_get_ref?(64, market_id);
+    if (~ found) { return (0, 0, 0, 0, 0); }
+    return unpack_market(mdata);
+}
+
+(int, int) get_shares(int market_id, slice addr) method_id {
+    (_, int ah) = parse_std_addr(addr);
+    return read_shares(load_ledger(), share_key(market_id, ah));
+}
+
+;; Approximate YES price as pool ratio (exact: use Go LMSR service)
+int get_price_yes_approx(int market_id) method_id {
+    var (_, _, _, _, markets) = load_global();
+    (cell mdata, int found) = markets.udict_get_ref?(64, market_id);
+    if (~ found) { return 500000000; }
+    var (_, _, _, yes_t, no_t) = unpack_market(mdata);
+    int total = yes_t + no_t;
+    if (total == 0) { return 500000000; }
+    return muldiv(yes_t, NANO, total);
+}
