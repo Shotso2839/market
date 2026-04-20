@@ -14,6 +14,7 @@ import hashlib
 import hmac
 import time
 import httpx
+import json
 from typing import Optional
 from datetime import datetime
 
@@ -219,16 +220,27 @@ class TonService:
 
         Returns parsed user dict if valid, None otherwise.
         """
-        if not settings.TELEGRAM_BOT_TOKEN:
-            # Dev mode: skip verification
-            import urllib.parse
-            params = dict(urllib.parse.parse_qsl(init_data))
-            import json
-            user_str = params.get("user", "{}")
-            return json.loads(user_str)
-
         import urllib.parse
-        import json
+
+        if not settings.TELEGRAM_BOT_TOKEN:
+            # Local development outside Telegram: allow a stable synthetic user.
+            if not init_data or init_data == "dev_mode":
+                return {
+                    "id": 999000111,
+                    "username": "dev_user",
+                    "first_name": "Dev",
+                }
+
+            params = dict(urllib.parse.parse_qsl(init_data))
+            user_str = params.get("user")
+            if user_str:
+                return json.loads(user_str)
+
+            return {
+                "id": 999000111,
+                "username": "dev_user",
+                "first_name": "Dev",
+            }
 
         try:
             params = dict(urllib.parse.parse_qsl(init_data))

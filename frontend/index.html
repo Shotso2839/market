@@ -656,7 +656,9 @@ async function loadStats(){
 // ── Position modal ────────────────────────────────────────────────
 function openBet(id,out='yes',e){
   e&&e.stopPropagation();
-  if(!wallet){showToast(t('need_w'),true);return;}
+  const activeWallet=getActiveWallet();
+  if(!activeWallet){showToast(t('need_w'),true);return;}
+  wallet=activeWallet;
   const m=markets.find(x=>x.id===id);if(!m)return;
   activeMid=id;selOut_=out;
   document.getElementById('mtit').textContent=m.title;
@@ -727,7 +729,9 @@ async function confirmBet(){
 let selOracle='self';
 function selO(el,v){selOracle=v;document.querySelectorAll('.oopt').forEach(o=>o.classList.remove('sel'));el.classList.add('sel');}
 async function createMarket(){
-  if(!wallet){showToast(t('need_w'),true);return;}
+  const activeWallet=getActiveWallet();
+  if(!activeWallet){showToast(t('need_w'),true);return;}
+  wallet=activeWallet;
   const title=document.getElementById('ndesc').value.trim();
   const cat=document.getElementById('ncat').value;
   const end=document.getElementById('nend').value;
@@ -1074,19 +1078,150 @@ async function doExit(){
   closeDetail();
 }
 
-// Track position on successful bet
-const _origCB=confirmBet;
-window.confirmBet=async function(){
-  const mid=activeMid,out=selOut_,amt=parseFloat(document.getElementById('amt').value)||0;
-  await _origCB();
-  if(amt>0&&!document.getElementById('modal').classList.contains('open')){
-    myPositions[mid]={outcome:out,amount:amt,entryYesPct:markets.find(x=>x.id===mid)?.yes_pct||50};
-    // Refresh detail view if still open on same market
-    if(currentDetailId===mid&&document.getElementById('detailOverlay').classList.contains('open')){
-      renderMyPosition(markets.find(x=>x.id===mid)||{id:mid});
+function getWalletConnector(){
+  return (typeof TonWallet!=='undefined'&&TonWallet&&typeof TonWallet.getWallet==='function')?TonWallet:null;
+}
+
+function getActiveWallet(){
+  return getWalletConnector()?.getWallet?.()||wallet||null;
+}
+
+async function syncWalletToBackend(addr=null){
+  if(!apiOn||typeof Users==='undefined') return;
+  const tonAddress=addr||getActiveWallet()?.address;
+  if(!tonAddress) return;
+  try{await Users.update({tonAddress});}catch(e){console.warn('Wallet sync failed:',e?.message||e);}
+}
+
+async function handleWalletClick(){
+  const devWalletAddress='UQDEV000000000000000000000000000000000000000000';
+  const walletConnector=getWalletConnector();
+  if(walletConnector){
+    await walletConnector.connect();
+    return;
+  }
+  if(wallet){discoWallet();return;}
+  if(apiOn){try{const me=await Users.me();if(me.ton_address){const b=await Users.balance();setWallet(me.ton_address,b.balance_ton);loadStats();return;}}catch{}}
+  setWallet(devWalletAddress,142.5);
+  syncWalletToBackend(devWalletAddress);
+  showToast(t('w_ok')+t('dev_suffix'));
+}
+
+function setWallet(a,b){
+  const balance=Number.isFinite(Number(b))?Number(b):0;
+  wallet={address:a,balance};
+  const s=a.length>14?a.slice(0,6)+'...'+a.slice(-4):a;
+  document.getElementById('wtxt').textContent=s;
+  document.getElementById('wdot').className='wdot';
+  document.getElementById('walletBal').innerHTML=balance.toFixed(2)+'<span class="bal-ton"> TON</span>';
+  syncWalletToBackend(a);
+  loadStats();
+}
+
+function applyLocalBetToMarket(m,amount,outcome){
+  if(!m||!amount) return m;
+  if(outcome==='yes') m.yes_pool_ton=(m.yes_pool_ton||0)+amount;
+  else m.no_pool_ton=(m.no_pool_ton||0)+amount;
+  m.total_pool_ton=(m.yes_pool_ton||0)+(m.no_pool_ton||0);
+  if(m.total_pool_ton>0){
+    m.yes_pct=Math.round((m.yes_pool_ton||0)/m.total_pool_ton*100);
+    m.no_pct=100-m.yes_pct;
+  }
+  renderMarkets();
+  if(currentDetailId===m.id&&document.getElementById('detailOverlay').classList.contains('open')){
+    updateDetailPools(m);
+  }
+  return m;
+}
+
+async function refreshMarketState(marketId,fallbackAmount=0,fallbackOutcome='yes'){
+  const idx=markets.findIndex(x=>x.id===marketId);
+  if(apiOn&&typeof Markets!=='undefined'){
+    try{
+      const fresh=await Markets.get(marketId);
+      if(idx>=0) markets[idx]={...markets[idx],...fresh};
+      else markets.unshift(fresh);
+      const nextMarket=idx>=0?markets[idx]:markets[0];
+      renderMarkets();
+      if(currentDetailId===marketId&&document.getElementById('detailOverlay').classList.contains('open')) updateDetailPools(nextMarket);
+      return nextMarket;
+    }catch(e){
+      console.warn('Market refresh failed:',e?.message||e);
     }
   }
-};
+  return applyLocalBetToMarket(markets.find(x=>x.id===marketId),fallbackAmount,fallbackOutcome);
+}
+
+function trackMyPosition(marketId,outcome,amount){
+  myPositions[marketId]={outcome,amount,entryYesPct:markets.find(x=>x.id===marketId)?.yes_pct||50};
+  if(currentDetailId===marketId&&document.getElementById('detailOverlay').classList.contains('open')){
+    renderMyPosition(markets.find(x=>x.id===marketId)||{id:marketId});
+  }
+}
+
+async function confirmBet(){
+  const a=parseFloat(document.getElementById('amt').value);
+  if(!a||a<=0){showToast(t('enter_a'),true);return;}
+  const walletConnector=getWalletConnector();
+  const wi=getActiveWallet();
+  if(!wi){showToast(t('need_w'),true);return;}
+  const balance=Number(wi.balance);
+  if(Number.isFinite(balance)&&a>balance){showToast(t('insuf'),true);return;}
+  setRdy(false);
+  const m=markets.find(x=>x.id===activeMid);
+  if(!m){showToast('Market not found',true);setRdy(true);return;}
+  await syncWalletToBackend(wi.address);
+
+  if(m?.contract_address&&walletConnector?.isConnected?.()){
+    try{
+      const h=await walletConnector.placeBetOnChain(m.contract_address,selOut_,a);
+      showToast(t('tx_sent'));
+      if(apiOn) await Bets.place({marketId:activeMid,outcome:selOut_,amountTon:a,txHash:h});
+      await refreshMarketState(activeMid,a,selOut_);
+      trackMyPosition(activeMid,selOut_,a);
+      wi.balance=parseFloat(((balance||0)-a).toFixed(4));
+      wallet=wi;
+      document.getElementById('walletBal').innerHTML=(wi.balance||0).toFixed(2)+'<span class="bal-ton"> TON</span>';
+      document.getElementById('modal').classList.remove('open');
+      showToast(t('pos_ok'));
+      if(typeof TelegramApp!=='undefined') TelegramApp.haptic('medium');
+      loadStats();
+      return;
+    }catch(e){
+      showToast(e?.message?.includes('rejects')?t('cancel_u'):t('tx_err'),true);
+      setRdy(true);
+      return;
+    }
+  }
+
+  if(apiOn){
+    try{
+      await Bets.place({marketId:activeMid,outcome:selOut_,amountTon:a});
+      await refreshMarketState(activeMid,a,selOut_);
+      trackMyPosition(activeMid,selOut_,a);
+      wi.balance=parseFloat(((balance||0)-a).toFixed(4));
+      wallet=wi;
+      document.getElementById('walletBal').innerHTML=(wi.balance||0).toFixed(2)+'<span class="bal-ton"> TON</span>';
+      document.getElementById('modal').classList.remove('open');
+      showToast(t('pos_ok'));
+      if(typeof TelegramApp!=='undefined') TelegramApp.haptic('medium');
+      loadStats();
+      return;
+    }catch(e){
+      showToast(e.message,true);
+      setRdy(true);
+      return;
+    }
+  }
+
+  applyLocalBetToMarket(m,a,selOut_);
+  trackMyPosition(activeMid,selOut_,a);
+  wi.balance=parseFloat(((balance||0)-a).toFixed(4));
+  wallet=wi;
+  document.getElementById('walletBal').innerHTML=(wi.balance||0).toFixed(2)+'<span class="bal-ton"> TON</span>';
+  document.getElementById('modal').classList.remove('open');
+  showToast(t('pos_ok'));
+}
 
 init();
 </script>

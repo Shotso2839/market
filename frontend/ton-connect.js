@@ -8,7 +8,7 @@
  *   <script src="api.js"></script>
  *   <script src="ton-connect.js"></script>
  *
- * Then call TonConnect.init() once on app start.
+ * Then call TonWallet.init() once on app start.
  * Replaces handleWalletClick() in index.html.
  */
 
@@ -23,7 +23,7 @@ const TC_MANIFEST_URL = (() => {
 
 // ── Module ────────────────────────────────────────────────────────────────────
 
-const TonConnect = (() => {
+const TonWallet = (() => {
   let _ui = null;          // TonConnectUI instance
   let _wallet = null;      // current wallet info
   let _unsubscribe = null; // status listener cleanup
@@ -74,7 +74,16 @@ const TonConnect = (() => {
       name: walletInfo.device?.appName || 'Wallet',
     };
 
-    // Fetch live balance
+    // Register wallet address on the backend
+    if (typeof Users !== 'undefined') {
+      try {
+        await Users.update({ tonAddress: address });
+      } catch (e) {
+        console.warn('Failed to update wallet on backend:', e.message);
+      }
+    }
+
+    // Fetch live balance after the address is linked in the backend
     let balance = 0;
     try {
       if (typeof Users !== 'undefined') {
@@ -86,17 +95,8 @@ const TonConnect = (() => {
     _wallet.balance = balance;
     _updateWalletUI(_wallet);
 
-    // Register wallet address on the backend
-    if (typeof Users !== 'undefined') {
-      try {
-        await Users.update({ tonAddress: address });
-      } catch (e) {
-        console.warn('Failed to update wallet on backend:', e.message);
-      }
-    }
-
     // If we received a connect proof, verify it on the backend
-    if (walletInfo.connectItems?.tonProof?.proof && typeof TonConnect !== 'undefined') {
+    if (walletInfo.connectItems?.tonProof?.proof) {
       try {
         await _verifyProof(address, walletInfo.connectItems.tonProof.proof);
       } catch (e) {
@@ -104,7 +104,7 @@ const TonConnect = (() => {
       }
     }
 
-    if (typeof loadUserStats === 'function') loadUserStats();
+    if (typeof loadStats === 'function') loadStats();
   }
 
   // ── Proof verification ────────────────────────────────────────────────────
@@ -112,9 +112,9 @@ const TonConnect = (() => {
   async function _verifyProof(address, proof) {
     // proof shape from TON Connect:
     // { timestamp, domain: { lengthBytes, value }, signature, payload, stateInit? }
-    if (typeof window.TonConnect === 'undefined' || typeof window.TonConnect.connect !== 'function') return;
+    if (typeof window.TonApi === 'undefined' || typeof window.TonApi.connect !== 'function') return;
 
-    await window.TonConnect.connect({
+    await window.TonApi.connect({
       address,
       proof: {
         timestamp: proof.timestamp,
@@ -130,6 +130,25 @@ const TonConnect = (() => {
   // ── UI updates ────────────────────────────────────────────────────────────
 
   function _updateWalletUI(wallet) {
+    if (!wallet) {
+      if (typeof discoWallet === 'function') {
+        discoWallet();
+        return;
+      }
+      const walletDot = document.getElementById('wdot');
+      const walletText = document.getElementById('wtxt');
+      const walletBal = document.getElementById('walletBal');
+      if (walletDot) walletDot.className = 'wdot off';
+      if (walletText) walletText.textContent = 'Connect';
+      if (walletBal) walletBal.innerHTML = 'вЂ”<span class="bal-ton"> TON</span>';
+      return;
+    }
+
+    if (typeof setWallet === 'function') {
+      setWallet(wallet.address, wallet.balance || 0);
+      return;
+    }
+
     const btn  = document.getElementById('walletBtn');
     const dot  = document.getElementById('walletDot');
     const text = document.getElementById('walletText');
@@ -157,7 +176,7 @@ const TonConnect = (() => {
 
   async function connect() {
     if (!_ui) {
-      console.warn('TonConnect not initialised — call TonConnect.init() first');
+      console.warn('TonWallet not initialised - call TonWallet.init() first');
       return;
     }
 
@@ -184,7 +203,6 @@ const TonConnect = (() => {
     await _ui.disconnect();
     _wallet = null;
     _updateWalletUI(null);
-    if (typeof showToast === 'function') showToast('Кошелёк отключён');
   }
 
   // ── Connected modal (disconnect / copy address) ───────────────────────────
@@ -368,10 +386,12 @@ const TonConnect = (() => {
   return { init, connect, disconnect, sendTransaction, placeBetOnChain, getWallet, isConnected, getUI };
 })();
 
+window.TonWallet = TonWallet;
+
 // ── Wire into index.html ──────────────────────────────────────────────────────
 // Replaces the stub handleWalletClick() defined in index.html
 
-window.handleWalletClick = () => TonConnect.connect();
+window.handleWalletClick = () => TonWallet.connect();
 
 // Auto-init on DOM ready
-document.addEventListener('DOMContentLoaded', () => TonConnect.init());
+document.addEventListener('DOMContentLoaded', () => TonWallet.init());

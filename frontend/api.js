@@ -28,6 +28,38 @@ function authHeaders() {
   };
 }
 
+const CATEGORY_TO_BACKEND = {
+  Sports: '\u0421\u043f\u043e\u0440\u0442',
+  Crypto: '\u041a\u0440\u0438\u043f\u0442\u043e',
+  Politics: '\u041f\u043e\u043b\u0438\u0442\u0438\u043a\u0430',
+  Weather: '\u041f\u043e\u0433\u043e\u0434\u0430',
+  Other: '\u0414\u0440\u0443\u0433\u043e\u0435',
+};
+
+const CATEGORY_FROM_BACKEND = {
+  '\u0421\u043f\u043e\u0440\u0442': 'Sports',
+  '\u041a\u0440\u0438\u043f\u0442\u043e': 'Crypto',
+  '\u041f\u043e\u043b\u0438\u0442\u0438\u043a\u0430': 'Politics',
+  '\u041f\u043e\u0433\u043e\u0434\u0430': 'Weather',
+  '\u0414\u0440\u0443\u0433\u043e\u0435': 'Other',
+};
+
+function toBackendCategory(category) {
+  return CATEGORY_TO_BACKEND[category] || category;
+}
+
+function fromBackendCategory(category) {
+  return CATEGORY_FROM_BACKEND[category] || category;
+}
+
+function normalizeMarket(market) {
+  return market ? { ...market, category: fromBackendCategory(market.category) } : market;
+}
+
+function normalizeMarketPage(page) {
+  return page?.items ? { ...page, items: page.items.map(normalizeMarket) } : page;
+}
+
 // ── Generic fetch wrapper ─────────────────────────────────────────────────────
 
 async function apiFetch(path, options = {}) {
@@ -48,12 +80,12 @@ const Markets = {
   list({ status, category, page = 1, pageSize = 20 } = {}) {
     const params = new URLSearchParams({ page, page_size: pageSize });
     if (status)   params.set('status', status);
-    if (category) params.set('category', category);
-    return apiFetch(`/markets?${params}`);
+    if (category) params.set('category', toBackendCategory(category));
+    return apiFetch(`/markets?${params}`).then(normalizeMarketPage);
   },
 
   get(id) {
-    return apiFetch(`/markets/${id}`);
+    return apiFetch(`/markets/${id}`).then(normalizeMarket);
   },
 
   create({ title, description, category, oracleType, betClosesAt }) {
@@ -62,18 +94,18 @@ const Markets = {
       body: JSON.stringify({
         title,
         description,
-        category,
+        category: toBackendCategory(category),
         oracle_type: oracleType,
         bet_closes_at: betClosesAt,
       }),
-    });
+    }).then(normalizeMarket);
   },
 
   resolve(id, winningOutcome, resolutionTxHash = null) {
     return apiFetch(`/markets/${id}/resolve`, {
       method: 'POST',
       body: JSON.stringify({ winning_outcome: winningOutcome, resolution_tx_hash: resolutionTxHash }),
-    });
+    }).then(normalizeMarket);
   },
 };
 
@@ -131,7 +163,7 @@ const Users = {
 
 // ── TON Connect ───────────────────────────────────────────────────────────────
 
-const TonConnect = {
+const TonApi = {
   connect({ address, proof, network = 'testnet' }) {
     return apiFetch('/ton/connect', {
       method: 'POST',
@@ -154,6 +186,8 @@ const TonConnect = {
     return apiFetch(`/ton/contract/${address}/state`);
   },
 };
+
+window.TonApi = TonApi;
 
 // ── WebSocket manager ─────────────────────────────────────────────────────────
 
@@ -369,5 +403,5 @@ const TelegramApp = {
 
 // Export for module usage (optional)
 if (typeof module !== 'undefined') {
-  module.exports = { Markets, Bets, Users, TonConnect, MarketSocket, UserSocket, TelegramApp };
+  module.exports = { Markets, Bets, Users, TonApi, MarketSocket, UserSocket, TelegramApp };
 }
