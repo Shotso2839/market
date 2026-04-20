@@ -19,6 +19,8 @@ class Settings(BaseSettings):
 
     # Smart contract
     PREDICTION_CONTRACT_ADDRESS: str = ""  # Deploy and set here
+    PLATFORM_TON_ADDRESS: str = ""
+    DEPLOYER_MNEMONIC: str = ""
 
     # Telegram
     TELEGRAM_BOT_TOKEN: str = ""

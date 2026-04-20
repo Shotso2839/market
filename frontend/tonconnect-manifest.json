@@ -1,7 +1,7 @@
 {
-  "url": "https://example.com",
+  "url": "http://localhost:3000",
   "name": "TON Prediction",
-  "iconUrl": "https://example.com/icon-192.png",
-  "termsOfUseUrl": "https://example.com/terms",
-  "privacyPolicyUrl": "https://example.com/privacy"
+  "iconUrl": "http://localhost:3000/icon-180.png",
+  "termsOfUseUrl": "http://localhost:3000/terms.html",
+  "privacyPolicyUrl": "http://localhost:3000/privacy.html"
 }

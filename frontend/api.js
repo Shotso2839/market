@@ -7,9 +7,10 @@
 
 // ── Config ────────────────────────────────────────────────────────────────────
 
-const API_BASE = window.location.hostname === 'localhost'
-  ? 'http://localhost:8000/api/v1'
-  : '/api/v1';                          // same-origin in production
+const API_BASE = window.__TONPRED_API_BASE__
+  || (window.location.hostname === 'localhost'
+    ? 'http://localhost:8000/api/v1'
+    : '/api/v1');                        // same-origin in production
 
 const WS_BASE = API_BASE
   .replace('http://', 'ws://')
