@@ -1,8 +1,8 @@
 param(
     [int]$Port = 3100,
     [long]$DevChatId = 0,
-    [ValidateSet("localtunnel", "localhostrun")]
-    [string]$TunnelProvider = "localtunnel",
+    [ValidateSet("auto", "localtunnel", "localhostrun")]
+    [string]$TunnelProvider = "auto",
     [string]$TunnelUser = "nokey@localhost.run"
 )
 
@@ -131,6 +131,26 @@ function Wait-Http {
     throw "Timed out waiting for $Url"
 }
 
+function Wait-PublicTunnel {
+    param(
+        [string]$Url,
+        [int]$Attempts = 6
+    )
+
+    for ($i = 0; $i -lt $Attempts; $i++) {
+        try {
+            $response = Invoke-WebRequest -Uri "$Url/" -TimeoutSec 10 -UseBasicParsing
+            if ($response.StatusCode -ge 200 -and $response.StatusCode -lt 400) {
+                return
+            }
+        } catch {
+            Start-Sleep -Seconds 2
+        }
+    }
+
+    throw "Public tunnel did not become reachable: $Url"
+}
+
 function Restart-BackendServices {
     Write-Host "Recreating API and Telegram bot..."
     Push-Location $backendDir
@@ -255,6 +275,8 @@ function Start-LocalTunnel {
         throw "Could not detect localtunnel URL. Check $outLog and $errLog"
     }
 
+    Wait-PublicTunnel -Url $publicUrl
+
     return $publicUrl
 }
 
@@ -296,6 +318,8 @@ function Start-LocalhostRunTunnel {
         throw "Could not detect localhost.run URL. Check $outLog and $errLog"
     }
 
+    Wait-PublicTunnel -Url $publicUrl
+
     return $publicUrl
 }
 
@@ -304,7 +328,16 @@ function Start-PublicTunnel {
         return Start-LocalTunnel
     }
 
-    return Start-LocalhostRunTunnel
+    if ($TunnelProvider -eq "localhostrun") {
+        return Start-LocalhostRunTunnel
+    }
+
+    try {
+        return Start-LocalTunnel
+    } catch {
+        Write-Warning "localtunnel failed, falling back to localhost.run: $_"
+        return Start-LocalhostRunTunnel
+    }
 }
 
 Restart-BackendServices
