@@ -1,6 +1,8 @@
 param(
     [int]$Port = 3100,
     [long]$DevChatId = 0,
+    [ValidateSet("localtunnel", "localhostrun")]
+    [string]$TunnelProvider = "localtunnel",
     [string]$TunnelUser = "nokey@localhost.run"
 )
 
@@ -187,20 +189,8 @@ function Send-DevChatLaunchMessage {
 
     $payload = @{
         chat_id = $DevChatId
-        text = "TONPRED local mode is ready. Open the fresh button below."
-        reply_markup = @{
-            inline_keyboard = @(
-                @(
-                    @{
-                        text = "Open app"
-                        web_app = @{
-                            url = "$Url/"
-                        }
-                    }
-                )
-            )
-        }
-    } | ConvertTo-Json -Compress -Depth 8
+        text = "TONPRED local mode is ready. Use the chat menu button 'Open app'. URL: $Url/"
+    } | ConvertTo-Json -Compress -Depth 4
 
     Invoke-RestMethod `
         -Uri "https://api.telegram.org/bot$token/sendMessage" `
@@ -211,16 +201,61 @@ function Send-DevChatLaunchMessage {
 
 function Stop-PreviousTunnel {
     $procs = Get-CimInstance Win32_Process | Where-Object {
-        $_.Name -eq "ssh.exe" -and $_.CommandLine -match "localhost\.run" -and $_.CommandLine -match "127\.0\.0\.1:\d+"
+        (
+            $_.Name -eq "ssh.exe" -and $_.CommandLine -match "localhost\.run" -and $_.CommandLine -match "127\.0\.0\.1:\d+"
+        ) -or (
+            $_.Name -match "^(cmd|node)(\.exe)?$" -and $_.CommandLine -match "localtunnel|lt\.js"
+        )
     }
 
     foreach ($proc in $procs) {
         try {
             Stop-Process -Id $proc.ProcessId -Force -ErrorAction Stop
         } catch {
-            Write-Warning "Failed to stop old localhost.run tunnel $($proc.ProcessId): $_"
+            Write-Warning "Failed to stop old tunnel process $($proc.ProcessId): $_"
         }
     }
+}
+
+function Start-LocalTunnel {
+    $runId = Get-Date -Format "yyyyMMddHHmmssfff"
+    $outLog = Join-Path $root ".tmp-localtunnel.$runId.out.log"
+    $errLog = Join-Path $root ".tmp-localtunnel.$runId.err.log"
+
+    Stop-PreviousTunnel
+    Start-Sleep -Seconds 2
+
+    Write-Host "Starting HTTPS relay via localtunnel..."
+    Start-Process -FilePath "cmd.exe" `
+        -ArgumentList "/c", "npx --yes localtunnel --port $GatewayPort --local-host 127.0.0.1" `
+        -WorkingDirectory $root `
+        -RedirectStandardOutput $outLog `
+        -RedirectStandardError $errLog `
+        -WindowStyle Hidden | Out-Null
+
+    $publicUrl = $null
+    for ($i = 0; $i -lt 45; $i++) {
+        Start-Sleep -Seconds 2
+        $logs = ""
+        if (Test-Path $outLog) {
+            $logs += (Get-Content $outLog -Raw)
+        }
+        if (Test-Path $errLog) {
+            $logs += "`n" + (Get-Content $errLog -Raw)
+        }
+
+        $match = [Regex]::Match($logs, "https://[a-zA-Z0-9.-]+")
+        if ($match.Success) {
+            $publicUrl = $match.Value
+            break
+        }
+    }
+
+    if (-not $publicUrl) {
+        throw "Could not detect localtunnel URL. Check $outLog and $errLog"
+    }
+
+    return $publicUrl
 }
 
 function Start-LocalhostRunTunnel {
@@ -264,6 +299,14 @@ function Start-LocalhostRunTunnel {
     return $publicUrl
 }
 
+function Start-PublicTunnel {
+    if ($TunnelProvider -eq "localtunnel") {
+        return Start-LocalTunnel
+    }
+
+    return Start-LocalhostRunTunnel
+}
+
 Restart-BackendServices
 Wait-Http -Url "http://127.0.0.1:8000/health"
 
@@ -271,7 +314,7 @@ $GatewayPort = Get-FreeGatewayPort -StartPort $Port
 Start-Gateway
 Wait-Http -Url "http://127.0.0.1:$GatewayPort/health"
 
-$publicUrl = Start-LocalhostRunTunnel
+$publicUrl = Start-PublicTunnel
 
 Update-EnvValue -Name "MINI_APP_URL" -Value $publicUrl
 Set-AllowedOrigins -Url $publicUrl
@@ -279,7 +322,6 @@ Set-AllowedOrigins -Url $publicUrl
 Restart-BackendServices
 Wait-Http -Url "http://127.0.0.1:8000/health"
 
-Start-Gateway -PublicAppUrl $publicUrl
 Wait-Http -Url "http://127.0.0.1:$GatewayPort/health"
 Wait-Http -Url "http://127.0.0.1:$GatewayPort/tonconnect-manifest.json"
 
@@ -289,6 +331,7 @@ Send-DevChatLaunchMessage -Url $publicUrl
 
 Write-Host ""
 Write-Host "Local gateway: http://127.0.0.1:$GatewayPort"
+Write-Host "Tunnel provider: $TunnelProvider"
 Write-Host "Public URL: $publicUrl"
 Write-Host "Mini App: $publicUrl/"
 Write-Host "Manifest: $publicUrl/tonconnect-manifest.json"
