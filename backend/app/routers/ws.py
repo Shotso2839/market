@@ -1,38 +1,51 @@
 """
-WebSocket endpoints
+WebSocket endpoints.
 
-  GET /api/v1/ws/market/{market_id}   — subscribe to a single market
-  GET /api/v1/ws/user                 — personal notifications channel
+GET /api/v1/ws/market/{market_id} -> subscribe to a single market
+GET /api/v1/ws/user -> personal notifications channel
 
 Auth: Telegram initData passed as query param ?init_data=...
-      (headers are not available during the WS handshake in most clients)
+because headers are not reliably available during the WebSocket handshake.
 """
+
 import asyncio
 import json
 import logging
-from fastapi import APIRouter, WebSocket, WebSocketDisconnect, Query, Depends
+
+from fastapi import APIRouter, Query, WebSocket, WebSocketDisconnect
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.database import get_db
-from app.websocket import ws_manager, emit_market_update
-from app.services.ton_service import ton_service
+from app.database import AsyncSessionLocal
+from app.models import User
 from app.services.market_service import market_service
-from app.models import User, MarketStatus
-from sqlalchemy import select
+from app.services.ton_service import ton_service
+from app.websocket import ws_manager
 
 log = logging.getLogger(__name__)
 router = APIRouter()
 
 
 async def _auth_ws(init_data: str, db: AsyncSession) -> User | None:
-    """Authenticate WebSocket connection via Telegram initData query param."""
+    """Authenticate a WebSocket connection via Telegram initData."""
     tg_user = ton_service.verify_telegram_init_data(init_data or "")
     if not tg_user:
         return None
+
     result = await db.execute(
         select(User).where(User.telegram_id == tg_user.get("id"))
     )
     return result.scalar_one_or_none()
+
+
+async def _get_ws_user(init_data: str) -> User | None:
+    async with AsyncSessionLocal() as db:
+        return await _auth_ws(init_data, db)
+
+
+async def _get_market_snapshot(market_id: str):
+    async with AsyncSessionLocal() as db:
+        return await market_service.get_by_id(db, market_id)
 
 
 @router.websocket("/market/{market_id}")
@@ -40,30 +53,31 @@ async def ws_market(
     market_id: str,
     websocket: WebSocket,
     init_data: str = Query(default=""),
-    db: AsyncSession = Depends(get_db),
 ):
     """
     Subscribe to live updates for one market.
 
     Server pushes:
-      • market_update  — pool sizes change after any bet
-      • new_bet        — anonymised bet just landed
-      • market_resolved — winner declared
-      • ping           — keepalive every 30s
+      - market_update
+      - new_bet
+      - market_resolved
+      - ping
 
     Client can send:
-      • {"action": "ping"} → server replies {"event": "pong"}
+      - {"action": "ping"} -> {"event": "pong"}
     """
-    # Auth (optional for market rooms — public data)
-    user = await _auth_ws(init_data, db)
-
     room = f"market:{market_id}"
     await ws_manager.connect(room, websocket)
 
-    # Send current state immediately on connect
-    market = await market_service.get_by_id(db, market_id)
-    if market:
-        await websocket.send_json({
+    market = await _get_market_snapshot(market_id)
+    if not market:
+        await websocket.send_json({"event": "error", "detail": "Market not found"})
+        await ws_manager.disconnect(room, websocket)
+        await websocket.close(code=4404)
+        return
+
+    await websocket.send_json(
+        {
             "event": "connected",
             "market_id": market_id,
             "status": market.status.value,
@@ -72,13 +86,9 @@ async def ws_market(
             "yes_pct": market.yes_pct,
             "no_pct": market.no_pct,
             "viewers": ws_manager.room_size(room),
-        })
-    else:
-        await websocket.send_json({"event": "error", "detail": "Market not found"})
-        await ws_manager.disconnect(room, websocket)
-        return
+        }
+    )
 
-    # Keepalive + receive loop
     try:
         while True:
             try:
@@ -87,15 +97,16 @@ async def ws_market(
                 if msg.get("action") == "ping":
                     await websocket.send_json({"event": "pong"})
             except asyncio.TimeoutError:
-                # Send server-side keepalive
-                await websocket.send_json({
-                    "event": "ping",
-                    "viewers": ws_manager.room_size(room),
-                })
+                await websocket.send_json(
+                    {
+                        "event": "ping",
+                        "viewers": ws_manager.room_size(room),
+                    }
+                )
     except WebSocketDisconnect:
         pass
     except Exception as e:
-        log.warning(f"WS market/{market_id} error: {e}")
+        log.warning("WS market/%s error: %s", market_id, e)
     finally:
         await ws_manager.disconnect(room, websocket)
 
@@ -104,18 +115,17 @@ async def ws_market(
 async def ws_user(
     websocket: WebSocket,
     init_data: str = Query(default=""),
-    db: AsyncSession = Depends(get_db),
 ):
     """
-    Personal notifications channel (authenticated).
+    Personal notifications channel.
 
     Server pushes:
-      • bet_confirmed   — tx verified on-chain
-      • payout_ready    — user won, can claim
-      • market_resolved — market the user bet on was resolved
-      • ping            — keepalive every 30s
+      - bet_confirmed
+      - payout_ready
+      - market_resolved
+      - ping
     """
-    user = await _auth_ws(init_data, db)
+    user = await _get_ws_user(init_data)
     if not user:
         await websocket.accept()
         await websocket.send_json({"event": "error", "detail": "Unauthorized"})
@@ -124,12 +134,13 @@ async def ws_user(
 
     room = f"user:{user.id}"
     await ws_manager.connect(room, websocket)
-
-    await websocket.send_json({
-        "event": "connected",
-        "user_id": user.id,
-        "username": user.username,
-    })
+    await websocket.send_json(
+        {
+            "event": "connected",
+            "user_id": user.id,
+            "username": user.username,
+        }
+    )
 
     try:
         while True:
@@ -143,7 +154,7 @@ async def ws_user(
     except WebSocketDisconnect:
         pass
     except Exception as e:
-        log.warning(f"WS user/{user.id} error: {e}")
+        log.warning("WS user/%s error: %s", user.id, e)
     finally:
         await ws_manager.disconnect(room, websocket)
 
@@ -152,13 +163,9 @@ async def ws_user(
 async def ws_admin(
     websocket: WebSocket,
     init_data: str = Query(default=""),
-    db: AsyncSession = Depends(get_db),
 ):
-    """
-    Admin dashboard feed — total connections, recent events.
-    Requires an authenticated user (extend with admin role check as needed).
-    """
-    user = await _auth_ws(init_data, db)
+    """Admin dashboard feed."""
+    user = await _get_ws_user(init_data)
     if not user:
         await websocket.accept()
         await websocket.send_json({"event": "error", "detail": "Unauthorized"})
@@ -167,20 +174,24 @@ async def ws_admin(
 
     room = "admin"
     await ws_manager.connect(room, websocket)
-    await websocket.send_json({
-        "event": "connected",
-        "total_connections": ws_manager.total_connections,
-    })
+    await websocket.send_json(
+        {
+            "event": "connected",
+            "total_connections": ws_manager.total_connections,
+        }
+    )
 
     try:
         while True:
             try:
                 await asyncio.wait_for(websocket.receive_text(), timeout=30.0)
             except asyncio.TimeoutError:
-                await websocket.send_json({
-                    "event": "stats",
-                    "total_connections": ws_manager.total_connections,
-                })
+                await websocket.send_json(
+                    {
+                        "event": "stats",
+                        "total_connections": ws_manager.total_connections,
+                    }
+                )
     except WebSocketDisconnect:
         pass
     finally:

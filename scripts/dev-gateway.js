@@ -21,9 +21,25 @@ const contentTypes = {
   '.webp': 'image/webp',
 };
 
+function firstForwardedValue(value, fallback = '') {
+  if (Array.isArray(value)) {
+    value = value[0];
+  }
+  if (typeof value !== 'string') {
+    return fallback;
+  }
+  const normalized = value.split(',')[0].trim();
+  return normalized || fallback;
+}
+
 function getBaseUrl(req) {
-  const proto = req.headers['x-forwarded-proto'] || 'http';
-  return `${proto}://${req.headers.host}`;
+  const rawProto = firstForwardedValue(req.headers['x-forwarded-proto'], 'http').replace(/:$/, '');
+  const proto = rawProto === 'https' ? 'https' : 'http';
+  const host = firstForwardedValue(
+    req.headers['x-forwarded-host'],
+    firstForwardedValue(req.headers.host, `127.0.0.1:${port}`),
+  );
+  return `${proto}://${host}`;
 }
 
 function sendJson(res, code, payload) {
@@ -42,8 +58,9 @@ function serveFile(res, filePath) {
       return;
     }
     const ext = path.extname(filePath).toLowerCase();
+    const noStoreExtensions = new Set(['.html', '.js', '.json']);
     res.writeHead(200, {
-      'Cache-Control': ext === '.html' ? 'no-store' : 'public, max-age=300',
+      'Cache-Control': noStoreExtensions.has(ext) ? 'no-store' : 'public, max-age=300',
       'Content-Type': contentTypes[ext] || 'application/octet-stream',
     });
     res.end(data);
@@ -132,7 +149,7 @@ const server = http.createServer((req, res) => {
     return;
   }
 
-  if (req.url === '/tonconnect-manifest.json') {
+  if (req.url.startsWith('/tonconnect-manifest.json')) {
     const baseUrl = getBaseUrl(req);
     sendJson(res, 200, {
       url: baseUrl,

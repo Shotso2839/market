@@ -459,8 +459,8 @@ body.light .mbg{background:rgba(50,40,30,.5);}
 <script src="https://telegram.org/js/telegram-web-app.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.min.js"></script>
 <script src="https://unpkg.com/@tonconnect/ui@2.0.6/dist/tonconnect-ui.min.js"></script>
-<script src="api.js"></script>
-<script src="ton-connect.js"></script>
+<script src="api.js?v=20260421c"></script>
+<script src="ton-connect.js?v=20260421c"></script>
 <script>
 // ── i18n ──────────────────────────────────────────────────────────
 const TR={en:{balance:'Balance',won:'Won',positions:'Positions',tab_all:'All',tab_open:'Open',tab_resolved:'Resolved',tab_my:'Mine',cat_all:'All',cat_sports:'Sports',cat_crypto:'Crypto',cat_politics:'Politics',cat_weather:'Weather',cat_other:'Other',no_wallet:'No wallet connected',position_history:'Position history',new_market:'New market',event_desc:'Event description',category:'Category',close_date:'Position close date',oracle:'Oracle',oracle_self:'Myself',create_market:'Create market ✦',nav_markets:'Markets',nav_create:'Create',nav_profile:'Profile',markets_created:'Markets created',connect:'Connect',open_position:'Open position →',potential_return:'Potential return',pool:'Pool',open:'Open',closed:'Closed',resolved:'Resolved',cancelled:'Cancelled',expired:'Expired',ph_desc:"E.g. Will Bitcoin reach $100k by June?",ph_amt:'Amount in TON',yes_lbl:'YES',no_lbl:'NO',in_play:'In play',won_lbl:'Won',online:'online',offline:'offline',yes_probability:'YES probability',pool_size:'Pool size',my_position:'My position',staked:'Staked',exit_position:'Exit position & withdraw',exit_confirm_title:'Confirm exit',cancel:'Cancel',confirm_exit:'Withdraw →',live_activity:'Live activity',fee_note:'A 0.5% exit fee applies. Your share will be calculated at current pool ratios.',creating:'Creating…',market_ok:'Market created! ✓',w_ok:'Wallet connected',w_off:'Wallet disconnected',need_w:'Please connect your wallet',no_mkt:'No markets match this filter',offline_m:'Working in offline mode',tx_sent:'Transaction sent…',pos_ok:'Position opened! ✓',enter_a:'Enter amount',insuf:'Insufficient funds',cancel_u:'Cancelled',tx_err:'Transaction error',enter_d:'Enter event description',enter_dt:'Set position close date',dev_suffix:' (dev)'},
@@ -491,7 +491,7 @@ function applyTheme(){document.body.classList.toggle('light',!dark);document.get
 function toggleTheme(){dark=!dark;localStorage.setItem('theme',dark?'dark':'light');applyTheme();}
 
 // ── State ─────────────────────────────────────────────────────────
-let markets=[],myBets=[],wallet=null,currentTab='all',currentCat='all',selOut_='yes',activeMid=null,apiOn=false,userSock=null;
+let markets=[],myBets=[],wallet=null,currentTab='all',currentCat='all',selOut_='yes',activeMid=null,apiOn=false,userSock=null,lastGoodMarkets=[];
 const mSocks={};
 const MOCK=[
   {id:'m1',title:'Will Spartak win the next match?',   ru:'Выиграет ли «Спартак» следующий матч?',   category:'Sports',  status:'open',yes_pool_ton:24, no_pool_ton:18, yes_pct:57,no_pct:43,total_pool_ton:42, bet_closes_at:'2026-05-10T20:00:00Z'},
@@ -512,9 +512,23 @@ async function init(){
 
 // ── API check ─────────────────────────────────────────────────────
 async function checkApi(){
-  try{const r=await fetch((location.hostname==='localhost'?'http://localhost:8000':'')+'/health',{signal:AbortSignal.timeout(3000)});apiOn=r.ok;}catch{apiOn=false;}
+  apiOn=await checkApiWithRetry();
   document.getElementById('apiDot').className='api-dot '+(apiOn?'on':'err');
   document.getElementById('apiSt').textContent=t(apiOn?'online':'offline');
+}
+
+async function checkApiWithRetry(retries=3){
+  const healthUrl=(location.hostname==='localhost'?'http://localhost:8000':'')+'/health';
+  for(let attempt=1;attempt<=retries;attempt++){
+    try{
+      const r=await fetch(healthUrl,{signal:AbortSignal.timeout(8000)});
+      if(r.ok) return true;
+    }catch{}
+    if(attempt<retries){
+      await new Promise(r=>setTimeout(r,attempt*1000));
+    }
+  }
+  return false;
 }
 
 // ── Markets ───────────────────────────────────────────────────────
@@ -526,16 +540,36 @@ async function loadMarkets(){
       if(currentTab==='open') p.status='open';
       if(currentTab==='resolved') p.status='resolved';
       if(currentCat!=='all') p.category=currentCat;
-      const d=await Markets.list({...p,pageSize:30});
+      const d=await loadMarketsWithRetry({...p,pageSize:20});
       markets=d.items||[];
+      lastGoodMarkets=markets.map(m=>({...m}));
       if(currentTab==='my'&&wallet){
         const bd=await Bets.myBets(); myBets=bd||[];
         const ids=new Set(myBets.map(b=>b.market_id));
         markets=markets.filter(m=>ids.has(m.id));
       }
-    }catch(e){console.warn(e.message);markets=getMock();showToast(t('offline_m'));}
+    }catch(e){
+      console.warn(e.message);
+      markets=lastGoodMarkets.length?lastGoodMarkets.map(m=>({...m})):getMock();
+      showToast(t('offline_m'));
+    }
   }else{markets=getMock();}
   renderMarkets();
+}
+
+async function loadMarketsWithRetry(params,retries=3){
+  let lastError=null;
+  for(let attempt=1;attempt<=retries;attempt++){
+    try{
+      return await Markets.list(params);
+    }catch(e){
+      lastError=e;
+      if(attempt<retries){
+        await new Promise(r=>setTimeout(r,attempt*1200));
+      }
+    }
+  }
+  throw lastError||new Error('Failed to load markets');
 }
 
 function renderSkel(){

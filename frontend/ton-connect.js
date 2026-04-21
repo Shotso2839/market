@@ -18,7 +18,7 @@ const TC_MANIFEST_URL = (() => {
   // tonconnect-manifest.json must be served from your domain
   // In dev: http://localhost:5173/tonconnect-manifest.json
   const base = window.location.origin;
-  return base + '/tonconnect-manifest.json';
+  return base + '/tonconnect-manifest.json?v=20260421b';
 })();
 
 // ── Module ────────────────────────────────────────────────────────────────────
