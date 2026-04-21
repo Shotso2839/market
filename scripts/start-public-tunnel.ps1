@@ -92,8 +92,8 @@ function Add-OriginToEnv {
 }
 
 function Restart-BackendServices {
-    Write-Host "Restarting API and Telegram bot..."
-    docker compose restart api telegram-bot | Out-Host
+    Write-Host "Recreating API and Telegram bot..."
+    docker compose up -d --force-recreate api telegram-bot | Out-Host
 }
 
 Stop-PreviousTunnel
