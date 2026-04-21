@@ -8,6 +8,7 @@ $ErrorActionPreference = "Stop"
 $root = Split-Path -Parent $PSScriptRoot
 $backendDir = Join-Path $root "backend"
 $envFile = Join-Path $backendDir ".env"
+$frontendManifest = Join-Path $root "frontend\tonconnect-manifest.json"
 $outLog = Join-Path $root ".tmp-public-tunnel.out.log"
 $errLog = Join-Path $root ".tmp-public-tunnel.err.log"
 
@@ -91,9 +92,31 @@ function Add-OriginToEnv {
     }
 }
 
+function Update-FrontendManifest {
+    param([string]$BaseUrl)
+
+    $manifest = @{
+        url = $BaseUrl
+        name = "TON Prediction"
+        iconUrl = "$BaseUrl/icon-180.png"
+        termsOfUseUrl = "$BaseUrl/terms.html"
+        privacyPolicyUrl = "$BaseUrl/privacy.html"
+    } | ConvertTo-Json
+
+    Set-Content -Path $frontendManifest -Value $manifest -Encoding UTF8
+}
+
 function Restart-BackendServices {
     Write-Host "Recreating API and Telegram bot..."
     docker compose up -d --force-recreate api telegram-bot | Out-Host
+}
+
+function Configure-Bot {
+    try {
+        Invoke-RestMethod -Method Post -Uri "http://127.0.0.1:8000/api/v1/telegram/configure-bot" -TimeoutSec 20 | Out-Null
+    } catch {
+        Write-Warning "Failed to reconfigure Telegram bot menu button: $_"
+    }
 }
 
 Stop-PreviousTunnel
@@ -129,7 +152,10 @@ if (-not $publicUrl) {
 
 Update-EnvValue -Name "MINI_APP_URL" -Value $publicUrl
 Add-OriginToEnv -Url $publicUrl
+Update-FrontendManifest -BaseUrl $publicUrl
 Restart-BackendServices
+Start-Sleep -Seconds 3
+Configure-Bot
 
 Write-Host ""
 Write-Host "Public URL: $publicUrl"
