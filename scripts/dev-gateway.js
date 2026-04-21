@@ -8,6 +8,7 @@ const { URL } = require('url');
 const port = Number(process.env.PORT || 3000);
 const backendOrigin = new URL(process.env.BACKEND_ORIGIN || 'http://127.0.0.1:8000');
 const frontendDir = path.resolve(__dirname, '..', 'frontend');
+const publicAppUrl = (process.env.PUBLIC_APP_URL || '').trim();
 
 const contentTypes = {
   '.css': 'text/css; charset=utf-8',
@@ -33,6 +34,9 @@ function firstForwardedValue(value, fallback = '') {
 }
 
 function getBaseUrl(req) {
+  if (publicAppUrl) {
+    return publicAppUrl.replace(/\/+$/, '');
+  }
   const rawProto = firstForwardedValue(req.headers['x-forwarded-proto'], 'http').replace(/:$/, '');
   const proto = rawProto === 'https' ? 'https' : 'http';
   const host = firstForwardedValue(
