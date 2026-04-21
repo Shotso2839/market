@@ -11,6 +11,7 @@ $envFile = Join-Path $backendDir ".env"
 $frontendManifest = Join-Path $root "frontend\tonconnect-manifest.json"
 $gatewayOutLog = Join-Path $root ".tmp-gateway3100.out.log"
 $gatewayErrLog = Join-Path $root ".tmp-gateway3100.err.log"
+$userCloudflaredScript = Join-Path $PSScriptRoot "run-cloudflared-http2.ps1"
 
 function Update-EnvValue {
     param(
@@ -87,9 +88,20 @@ function Stop-Gateway {
 
 function Start-Gateway {
     Stop-Gateway
+    Start-Sleep -Seconds 1
 
-    if (Test-Path $gatewayOutLog) { Remove-Item $gatewayOutLog -Force }
-    if (Test-Path $gatewayErrLog) { Remove-Item $gatewayErrLog -Force }
+    foreach ($logFile in @($gatewayOutLog, $gatewayErrLog)) {
+        if (-not (Test-Path $logFile)) {
+            continue
+        }
+
+        try {
+            Remove-Item $logFile -Force -ErrorAction Stop
+        } catch {
+            # If Windows still keeps the handle for a moment, truncate instead of failing startup.
+            Set-Content -Path $logFile -Value "" -Encoding UTF8
+        }
+    }
 
     Write-Host "Starting local gateway on port $Port..."
     Start-Process -FilePath cmd.exe `
@@ -118,7 +130,12 @@ function Ensure-CloudflaredService {
 
 function Restart-BackendServices {
     Write-Host "Recreating API and Telegram bot..."
-    docker compose up -d --force-recreate api telegram-bot | Out-Host
+    Push-Location $backendDir
+    try {
+        docker compose up -d --force-recreate api telegram-bot | Out-Host
+    } finally {
+        Pop-Location
+    }
 }
 
 function Wait-Http {
@@ -143,6 +160,16 @@ function Configure-Bot {
     Invoke-RestMethod -Method Post -Uri "http://127.0.0.1:8000/api/v1/telegram/configure-bot" -TimeoutSec 20 | Out-Null
 }
 
+function Ensure-UserCloudflared {
+    if (-not (Test-Path $userCloudflaredScript)) {
+        Write-Warning "User-mode cloudflared helper script was not found: $userCloudflaredScript"
+        return
+    }
+
+    Write-Host "Ensuring user-mode cloudflared http2 connector..."
+    powershell -ExecutionPolicy Bypass -File $userCloudflaredScript | Out-Host
+}
+
 Update-EnvValue -Name "MINI_APP_URL" -Value $PublicAppUrl
 Add-OriginToEnv -Url $PublicAppUrl
 Update-FrontendManifest -BaseUrl $PublicAppUrl
@@ -153,6 +180,7 @@ Wait-Http -Url "http://127.0.0.1:8000/health"
 
 Start-Gateway
 Wait-Http -Url "http://127.0.0.1:$Port/health"
+Ensure-UserCloudflared
 
 Configure-Bot
 
